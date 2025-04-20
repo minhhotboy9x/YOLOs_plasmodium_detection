@@ -1,0 +1,21 @@
+validation:
+    ConfusionMatrix (self, nc, conf=0.25, iou_thres=0.45, task="detect"): 
+        iou_thres for matching bbox and gtbox is 0.45
+        conf for validation is default set to 0.25 (apply 0.25 if default val conf (0.001) is passed)
+
+    conf default for detection in eval process is 0.001
+
+validation pipeline:
+	preprocess batch
+	
+	calculate loss: in training and val process
+	
+	postprocess batch: non_max_suppression(conf, iou)
+		default conf=0.001, iou=0.7
+	
+	update_metrics()
+		update map50, map50:95
+		confusion matrix
+
+
+r_curve and p_curve are calculated at mAP 50

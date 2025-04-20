@@ -1,0 +1,11 @@
+prepare k-fold data
+
+prepare data folder:
+    DATA_NAME/
+        all_train/
+            images/
+            labels/
+        data.yaml
+        k_folds.ipynb
+
+run the k_folds.ipynb to get folds
