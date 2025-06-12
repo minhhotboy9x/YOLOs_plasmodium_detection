@@ -379,7 +379,7 @@ class CustomedConfusionMatrix(ConfusionMatrix):
                     FP_labels.append('background')
 
                     # save matched detection and gt class
-                    full_cls_detections.append(detections1[m1[j]].squeeze(0).clone())
+                    full_cls_detections.append(detections1[i].squeeze(0).clone())
                     matched_gt_names.append('background')
 
         mismatched_gt = torch.stack(mismatched_gt) if mismatched_gt else None
