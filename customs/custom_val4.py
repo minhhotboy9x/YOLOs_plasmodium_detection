@@ -7,21 +7,174 @@ sys.path.append(parent_dir)
 
 from pathlib import Path
 
+import json
 import numpy as np
 import torch
+import torchvision
 import cv2
 import warnings
 import matplotlib.pyplot as plt
 
 from .custom_res import CustomedResults
+from .utils import *
 from ultralytics import YOLO
+from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.engine.results import Results
 from ultralytics.utils import ops
-from ultralytics.utils import LOGGER, SimpleClass, TryExcept, plt_settings
-from ultralytics.data.utils import check_det_dataset
+from ultralytics.utils import LOGGER, SimpleClass, TryExcept, plt_settings, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.metrics import ConfusionMatrix, box_iou, batch_probiou, DetMetrics
 from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.utils.ops import xywh2xyxy, nms_rotated, xyxy2xywh, scale_boxes
+from ultralytics.utils.checks import check_imgsz
+from ultralytics.data.utils import check_cls_dataset, check_det_dataset
+from ultralytics.utils.ops import Profile
+from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
+def non_max_suppression(
+    prediction,
+    conf_thres=0.25,
+    iou_thres=0.45,
+    classes=None,
+    agnostic=False,
+    multi_label=False,
+    labels=(),
+    max_det=300,
+    nc=0,  # number of classes (optional)
+    max_time_img=0.05,
+    max_nms=30000,
+    max_wh=7680,
+    in_place=True,
+    rotated=False,
+    end2end=False,
+):
+    """
+    Perform non-maximum suppression (NMS) on a set of boxes, with support for masks and multiple labels per box.
+
+    Args:
+        prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 4 + num_masks, num_boxes)
+            containing the predicted boxes, classes, and masks. The tensor should be in the format
+            output by a model, such as YOLO.
+        conf_thres (float): The confidence threshold below which boxes will be filtered out.
+            Valid values are between 0.0 and 1.0.
+        iou_thres (float): The IoU threshold below which boxes will be filtered out during NMS.
+            Valid values are between 0.0 and 1.0.
+        classes (List[int]): A list of class indices to consider. If None, all classes will be considered.
+        agnostic (bool): If True, the model is agnostic to the number of classes, and all
+            classes will be considered as one.
+        multi_label (bool): If True, each box may have multiple labels.
+        labels (List[List[Union[int, float, torch.Tensor]]]): A list of lists, where each inner
+            list contains the apriori labels for a given image. The list should be in the format
+            output by a dataloader, with each label being a tuple of (class_index, x1, y1, x2, y2).
+        max_det (int): The maximum number of boxes to keep after NMS.
+        nc (int): The number of classes output by the model. Any indices after this will be considered masks.
+        max_time_img (float): The maximum time (seconds) for processing one image.
+        max_nms (int): The maximum number of boxes into torchvision.ops.nms().
+        max_wh (int): The maximum box width and height in pixels.
+        in_place (bool): If True, the input prediction tensor will be modified in place.
+        rotated (bool): If Oriented Bounding Boxes (OBB) are being passed for NMS.
+        end2end (bool): If the model doesn't require NMS.
+
+    Returns:
+        (List[torch.Tensor]): A list of length batch_size, where each element is a tensor of
+            shape (num_boxes, 6 + num_masks) containing the kept boxes, with columns
+            (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
+    """
+
+    # Checks
+    assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
+    assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
+    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+        prediction = prediction[0]  # select only inference output
+    if classes is not None:
+        classes = torch.tensor(classes, device=prediction.device)
+
+    if prediction.shape[-1] == 6 or end2end:  # end-to-end model (BNC, i.e. 1,300,6)
+        output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
+        if classes is not None:
+            output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
+        return output
+
+    bs = prediction.shape[0]  # batch size (BCN, i.e. 1,84,6300)
+    nc = nc or (prediction.shape[1] - 4)  # number of classes
+    nm = prediction.shape[1] - nc - 4  # number of masks
+    mi = 4 + nc  # mask start index
+    xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
+
+    # Settings
+    # min_wh = 2  # (pixels) minimum box width and height
+    time_limit = 2.0 + max_time_img * bs  # seconds to quit after
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+
+    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
+    if not rotated:
+        if in_place:
+            prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
+        else:
+            prediction = torch.cat((xywh2xyxy(prediction[..., :4]), prediction[..., 4:]), dim=-1)  # xywh to xyxy
+
+    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs # [tensor([], size=(0, 6))] for box, class, score
+    output1 = [torch.zeros((0, 4 + nc), device=prediction.device)] * bs # [tensor([], size=(0, 4 + nc))] for box, score1 ,score2, ..., scoreN
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence
+
+        # Cat apriori labels if autolabelling
+        if labels and len(labels[xi]) and not rotated:
+            lb = labels[xi]
+            v = torch.zeros((len(lb), nc + nm + 4), device=x.device)
+            v[:, :4] = xywh2xyxy(lb[:, 1:5])  # box
+            v[range(len(lb)), lb[:, 0].long() + 4] = 1.0  # cls
+            x = torch.cat((x, v), 0)
+        x1 = x.clone()
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Detections matrix nx6 (xyxy, conf, cls)
+        box, cls, mask = x.split((4, nc, nm), 1)
+
+        if multi_label:
+            i, j = torch.where(cls > conf_thres)
+            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1) # [N, box, score, class, mask]
+            x1 = torch.cat((box[i],               # [N, 4]
+                            cls[i],               # [N, nc]
+                            ), 1) # [N, box, score1, score2, ..., scoreN]
+        else:  # best class only
+            conf, j = cls.max(1, keepdim=True)
+            conf_mask = conf.view(-1) > conf_thres
+            x = torch.cat((box, conf, j.float(), mask), 1)[conf_mask] # [N, box, score, class, mask]
+            x1 = torch.cat((box, cls), 1)[conf_mask]  # [box, score1, score2, ..., scoreN]
+
+        # Filter by class
+        if classes is not None:
+            class_mask = (x[:, 5:6] == classes).any(1)
+            x = x[class_mask]
+            x1 = x1[class_mask]  # align x1 theo class_mask
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        if n > max_nms:  # excess boxes
+            topk = x[:, 4].argsort(descending=True)[:max_nms] # sort by confidence and remove excess boxes
+            x = x[topk]
+            x1 = x1[topk]  # align x1 theo top confidence  
+
+        # Batched NMS
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+        scores = x[:, 4]  # scores
+        if rotated:
+            boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
+            i = nms_rotated(boxes, scores, iou_thres)
+        else:
+            boxes = x[:, :4] + c  # boxes (offset by class)
+            i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        i = i[:max_det]  # limit detections
+
+        output[xi] = x[i]
+        output1[xi] = x1[i]  # align output1 theo i
+    return output, output1
 
 #---------------------------------------------------------- CustomedConfusionMatrix ----------------------------------------------------------#
 class CustomedConfusionMatrix(ConfusionMatrix):
@@ -50,7 +203,7 @@ class CustomedConfusionMatrix(ConfusionMatrix):
         self.matrix = np.zeros((model_nc + 1, nc + 1)) if self.task == "detect" else np.zeros((model_nc, nc))
         os.mkdir(self.save_dir / "false_detection")
     
-    def process_batch(self, pbatch, detections, gt_bboxes, gt_cls):
+    def process_batch(self, pbatch, detections, detections1, gt_bboxes, gt_cls):
         """
         Update confusion matrix for object detection task.
 
@@ -58,6 +211,7 @@ class CustomedConfusionMatrix(ConfusionMatrix):
             detections (Array[N, 6] | Array[N, 7]): Detected bounding boxes and their associated information.
                                       Each row should contain (x1, y1, x2, y2, conf, class)
                                       or with an additional element `angle` when it's obb.
+            detections1 (Array[N, 4 + C]): Detected bounding boxes and their associated class scores.
             gt_bboxes (Array[M, 4]| Array[N, 5]): Ground truth bounding boxes with xyxy/xyxyr format.
             gt_cls (Array[M]): The class labels.
         """
@@ -65,6 +219,10 @@ class CustomedConfusionMatrix(ConfusionMatrix):
         misdetected_detection = [] # result for false positive
         FP_labels = [] # result True label for false positive
         mismatched_gt = [] # result for false negative
+
+        full_cls_detections = [] # result for full class detection
+        matched_gt_names = []
+
         false_det_dir = self.save_dir / "false_detection" / f'{Path(pbatch["im_file"]).stem}_FP.jpg'
         false_gt_dir = self.save_dir / "false_detection" / f'{Path(pbatch["im_file"]).stem}_FN.jpg'
         all_det_dir = self.save_dir / "false_detection"  / f'{Path(pbatch["im_file"]).stem}_All.jpg'
@@ -72,9 +230,13 @@ class CustomedConfusionMatrix(ConfusionMatrix):
         false_det_txt = self.save_dir / "txt_detection" / f'{Path(pbatch["im_file"]).stem}_FP.txt'
         all_det_txt = self.save_dir / "txt_detection" / f'{Path(pbatch["im_file"]).stem}_All.txt'
 
+        det_gt_txt = self.save_dir / "det_gt" / f'{Path(pbatch["im_file"]).stem}_.txt'
+
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if detections is not None:
-                detections = detections[detections[:, 4] > self.conf]
+                masked_detections = detections[:, 4] > self.conf
+                detections = detections[masked_detections]
+                detections1 = detections1[masked_detections] 
                 detection_classes = detections[:, 5].int()
                 for index, dc in enumerate(detection_classes):
                     self.matrix[dc, self.nc] += 1  # false positives
@@ -89,6 +251,8 @@ class CustomedConfusionMatrix(ConfusionMatrix):
                     fp_back_ground_detection[4] = -fp_back_ground_detection[4]
                     misdetected_detection.append(fp_back_ground_detection)
 
+                    full_cls_detections.append(detections1[index].clone())
+
             # plot false positive
             misdetected_detection = torch.stack(misdetected_detection) if misdetected_detection else None
             if misdetected_detection is not None :
@@ -99,6 +263,8 @@ class CustomedConfusionMatrix(ConfusionMatrix):
                                     gt_labels=['background'] * len(misdetected_detection))
                 detect_res.save(false_det_dir, conf=False, line_width=3)
                 detect_res.save_pred_gt_txt(false_det_txt, save_conf=True)
+
+                save_full_det_gt(det_gt_txt, full_cls_detections, ['background'] * len(misdetected_detection), self.ori_names)
 
             # plot empty gt
             # gt_res = CustomedResults(pbatch['ori_img'], pbatch['im_file'], self.names)
@@ -142,7 +308,9 @@ class CustomedConfusionMatrix(ConfusionMatrix):
             # all_detect_res.save(all_det_dir, conf=True, line_width=3)
             return
 
-        detections = detections[detections[:, 4] > self.conf]
+        masked_detections = detections[:, 4] > self.conf
+        detections = detections[masked_detections]
+        detections1 = detections1[masked_detections]
         gt_classes = gt_cls.int()
         detection_classes = detections[:, 5].int()
         is_obb = detections.shape[1] == 7 and gt_bboxes.shape[1] == 5  # with additional `angle` dimension
@@ -165,7 +333,7 @@ class CustomedConfusionMatrix(ConfusionMatrix):
             matches = np.zeros((0, 3))
 
         n = matches.shape[0] > 0
-        m0, m1, _ = matches.transpose().astype(int)
+        m0, m1, _ = matches.transpose().astype(int) # m0 is gt index, m1 is detection index, _ is iou score
         for i, gc in enumerate(gt_classes):
             j = m0 == i # a list true/false for each gt and detection
             if n and sum(j) == 1:
@@ -186,6 +354,10 @@ class CustomedConfusionMatrix(ConfusionMatrix):
                     misdetected_detection.append(detections[m1[j]].squeeze(0))
                     mismatched_gt.append(torch.hstack((gt_bboxes[i], torch.ones(1).to(device), gc)))
                     FP_labels.append(self.names[int(gc.item())])
+                
+                # save matched detection and gt class
+                full_cls_detections.append(detections1[m1[j]].squeeze(0).clone())
+                matched_gt_names.append(self.names[int(gc.item())])
             else:
                 self.matrix[self.model_nc, gc] += 1  # true background
                 mismatched_gt.append(torch.hstack((gt_bboxes[i], torch.ones(1).to(device), gc)))
@@ -206,6 +378,10 @@ class CustomedConfusionMatrix(ConfusionMatrix):
                     misdetected_detection.append(fp_back_ground_detection)
                     FP_labels.append('background')
 
+                    # save matched detection and gt class
+                    full_cls_detections.append(detections1[m1[j]].squeeze(0).clone())
+                    matched_gt_names.append('background')
+
         mismatched_gt = torch.stack(mismatched_gt) if mismatched_gt else None
         misdetected_detection = torch.stack(misdetected_detection) if misdetected_detection else None
 
@@ -223,7 +399,10 @@ class CustomedConfusionMatrix(ConfusionMatrix):
         all_detect_res = Results(pbatch['ori_img'], pbatch['im_file'], self.ori_names, boxes=detections)
         all_detect_res.save(all_det_dir, conf=True, line_width=3)
         all_detect_res.save_txt(all_det_txt)
-    
+
+        # save full class detection
+        save_full_det_gt(det_gt_txt, full_cls_detections, matched_gt_names, self.ori_names)
+
     # @TryExcept("WARNING ⚠️ ConfusionMatrix plot failure")
     @plt_settings()
     def plot(self, normalize=True, save_dir="", model_names=(), label_names=(), on_plot=None):
@@ -300,6 +479,131 @@ class CustomedDetectionValidator(DetectionValidator):
         self.num_gt_classes = data_dict['nc']
         self.gt_names = data_dict['names']
         self.metrics.names = self.gt_names
+    
+    @smart_inference_mode()
+    def __call__(self, trainer=None, model=None):
+        """
+        Execute validation process, running inference on dataloader and computing performance metrics.
+
+        Args:
+            trainer (object, optional): Trainer object that contains the model to validate.
+            model (nn.Module, optional): Model to validate if not using a trainer.
+
+        Returns:
+            stats (dict): Dictionary containing validation statistics.
+        """
+        self.training = trainer is not None
+        augment = self.args.augment and (not self.training)
+        if self.training:
+            self.device = trainer.device
+            self.data = trainer.data
+            # Force FP16 val during training
+            self.args.half = self.device.type != "cpu" and trainer.amp
+            model = trainer.ema.ema or trainer.model
+            model = model.half() if self.args.half else model.float()
+            # self.model = model
+            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            model.eval()
+        else:
+            if str(self.args.model).endswith(".yaml") and model is None:
+                LOGGER.warning("WARNING ⚠️ validating an untrained model YAML will result in 0 mAP.")
+            callbacks.add_integration_callbacks(self)
+            model = AutoBackend(
+                weights=model or self.args.model,
+                device=select_device(self.args.device, self.args.batch),
+                dnn=self.args.dnn,
+                data=self.args.data,
+                fp16=self.args.half,
+            )
+            # self.model = model
+            self.device = model.device  # update device
+            self.args.half = model.fp16  # update half
+            stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+            imgsz = check_imgsz(self.args.imgsz, stride=stride)
+            if engine:
+                self.args.batch = model.batch_size
+            elif not pt and not jit:
+                self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
+                LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
+
+            if str(self.args.data).split(".")[-1] in {"yaml", "yml"}:
+                self.data = check_det_dataset(self.args.data)
+            elif self.args.task == "classify":
+                self.data = check_cls_dataset(self.args.data, split=self.args.split)
+            else:
+                raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
+
+            if self.device.type in {"cpu", "mps"}:
+                self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
+            if not pt:
+                self.args.rect = False
+            self.stride = model.stride  # used in get_dataloader() for padding
+            self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
+
+            model.eval()
+            model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
+
+        self.run_callbacks("on_val_start")
+        dt = (
+            Profile(device=self.device),
+            Profile(device=self.device),
+            Profile(device=self.device),
+            Profile(device=self.device),
+        )
+        bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
+        self.init_metrics(de_parallel(model))
+        self.jdict = []  # empty before each val
+        for batch_i, batch in enumerate(bar):
+            self.run_callbacks("on_val_batch_start")
+            self.batch_i = batch_i
+            # Preprocess
+            with dt[0]:
+                batch = self.preprocess(batch)
+
+            # Inference
+            with dt[1]:
+                preds = model(batch["img"], augment=augment)
+
+            # Loss
+            with dt[2]:
+                if self.training:
+                    self.loss += model.loss(batch, preds)[1]
+
+            # Postprocess
+            with dt[3]:
+                preds, preds1 = self.postprocess(preds)
+
+            self.update_metrics(preds, preds1, batch)
+            if self.args.plots and batch_i < 3:
+                self.plot_val_samples(batch, batch_i)
+                self.plot_predictions(batch, preds, batch_i)
+
+            self.run_callbacks("on_val_batch_end")
+        stats = self.get_stats()
+        self.check_stats(stats)
+        self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1e3 for x in dt)))
+        self.finalize_metrics()
+        self.print_results()
+        self.run_callbacks("on_val_end")
+        if self.training:
+            model.float()
+            results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix="val")}
+            return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
+        else:
+            LOGGER.info(
+                "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
+                    *tuple(self.speed.values())
+                )
+            )
+            if self.args.save_json and self.jdict:
+                with open(str(self.save_dir / "predictions.json"), "w", encoding="utf-8") as f:
+                    LOGGER.info(f"Saving {f.name}...")
+                    json.dump(self.jdict, f)  # flatten and save
+                stats = self.eval_json(stats)  # update stats
+            if self.args.plots or self.args.save_json:
+                LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
+            return stats
 
     def init_metrics(self, model):
         super().init_metrics(model)
@@ -318,6 +622,29 @@ class CustomedDetectionValidator(DetectionValidator):
             model_nc=len(self.init_names), 
             conf=self.args.conf)
     
+    def postprocess(self, preds):
+        """
+        Apply Non-maximum suppression to prediction outputs.
+
+        Args:
+            preds (torch.Tensor): Raw predictions from the model.
+
+        Returns:
+            (List[torch.Tensor], List[torch.Tensor]): Processed predictions after NMS.
+        """
+        return non_max_suppression(
+            preds,
+            self.args.conf,
+            self.args.iou,
+            labels=self.lb,
+            nc=self.nc,
+            multi_label=True,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            end2end=self.end2end,
+            rotated=self.args.task == "obb",
+        )
+
     def _prepare_batch(self, si, batch):
         """Prepares a batch of images and annotations for validation."""
         idx = batch["batch_idx"] == si
@@ -356,9 +683,9 @@ class CustomedDetectionValidator(DetectionValidator):
 
         return boxes[valid_mask]  # Chỉ giữ các box hợp lệ
 
-    def update_metrics(self, preds, batch):
+    def update_metrics(self, preds, preds1, batch):
         """Metrics."""
-        for si, pred in enumerate(preds):
+        for si, (pred, pred1) in enumerate(zip(preds, preds1)):
             self.seen += 1
             npr = len(pred)
             stat = dict(
@@ -377,13 +704,14 @@ class CustomedDetectionValidator(DetectionValidator):
                         self.stats[k].append(stat[k])
                     if self.args.plots:
                         # self.confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
-                        self.confusion_matrix.process_batch(pbatch, detections=None, gt_bboxes=bbox, gt_cls=cls)
+                        self.confusion_matrix.process_batch(pbatch, detections=None, detections1=None, gt_bboxes=bbox, gt_cls=cls)
                 continue
 
             # Predictions
             if self.args.single_cls:
                 pred[:, 5] = 0
             predn = self._prepare_pred(pred, pbatch)
+            predn1 = self._prepare_pred(pred1, pbatch)
             # predn = self.filter_boxes_near_border(predn, pbatch['ori_shape'])
             stat["conf"] = predn[:, 4]
             stat["pred_cls"] = predn[:, 5]
@@ -393,7 +721,7 @@ class CustomedDetectionValidator(DetectionValidator):
                 stat["tp"] = self._process_batch(predn, bbox, cls)
                 if self.args.plots:
                     # self.confusion_matrix.process_batch(predn, bbox, cls)
-                    self.confusion_matrix.process_batch(pbatch, predn, bbox, cls)
+                    self.confusion_matrix.process_batch(pbatch, predn, predn1, bbox, cls)
             for k in self.stats.keys():
                 self.stats[k].append(stat[k])
 

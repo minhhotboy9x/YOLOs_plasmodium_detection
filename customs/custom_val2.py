@@ -145,7 +145,7 @@ class CustomedConfusionMatrix(ConfusionMatrix):
 
         x = torch.where(iou > self.iou_thres)
         if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy() # (gt, pred, iou)
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]] # uniquify by detection
@@ -271,7 +271,7 @@ class CustomedDetectionValidator(DetectionValidator):
         validator()
         ```
     """
-    def __init__(self, ignore_gt_class:list = {}, ignore_FP_pair:dict = {}, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
+    def __init__(self, ignore_gt_class:dict = {}, ignore_FP_pair:dict = {}, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
         self.ignore_gt_class = ignore_gt_class
         self.ignore_FP_pair = ignore_FP_pair
@@ -303,7 +303,7 @@ class CustomedDetectionValidator(DetectionValidator):
                 "im_file": im_file,
                 "ori_img": ori_img,}
 
-    def filter_boxes_near_border(self, boxes, img_shape, margin=10):
+    def filter_boxes_near_border(self, boxes, img_shape, margin=5):
         """
         Loại bỏ các bounding box nằm gần biên ảnh.
         
@@ -319,7 +319,7 @@ class CustomedDetectionValidator(DetectionValidator):
 
         # Điều kiện: box phải nằm cách biên ít nhất 'margin' pixels
         valid_mask = (boxes[:, 0] >= margin) & (boxes[:, 1] >= margin) & \
-                    (boxes[:, 2] <= W - margin) & (boxes[:, 3] <= H - margin)
+                    (boxes[:, 2] < W - margin) & (boxes[:, 3] < H - margin)
 
         return boxes[valid_mask]  # Chỉ giữ các box hợp lệ
 
@@ -351,7 +351,7 @@ class CustomedDetectionValidator(DetectionValidator):
             if self.args.single_cls:
                 pred[:, 5] = 0
             predn = self._prepare_pred(pred, pbatch)
-            predn = self.filter_boxes_near_border(predn, pbatch['ori_shape'])
+            # predn = self.filter_boxes_near_border(predn, pbatch['ori_shape'])
             stat["conf"] = predn[:, 4]
             stat["pred_cls"] = predn[:, 5]
 
